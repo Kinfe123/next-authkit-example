@@ -1,4 +1,4 @@
-import { Connection, WorkOS } from "@workos-inc/node";
+import { WorkOS } from "@workos-inc/node";
 import { auth } from "../src/lib/auth";
 import { generateRandomString, symmetricEncrypt } from "better-auth/crypto";
 
@@ -65,6 +65,24 @@ interface WorkOSSession {
   active: boolean;
 }
 
+interface WorkOSOAuthConnection {
+  id: string;
+  type: string;
+  state: "active" | "inactive";
+  createdAt: string;
+  updatedAt: string;
+  profile: {
+    id: string;
+    email: string;
+    firstName?: string;
+    lastName?: string;
+    accessToken?: string;
+    refreshToken?: string;
+    expiresAt?: string;
+    scope?: string;
+  };
+}
+
 if (!process.env.WORKOS_API_KEY || !process.env.WORKOS_CLIENT_ID) {
   throw new Error("Missing required environment variables WORKOS_API_KEY and/or WORKOS_CLIENT_ID");
 }
@@ -106,8 +124,8 @@ async function migrateFromWorkOS() {
       const response = await workos.userManagement.listUsers({
         limit,
         before,
-      }) as WorkOSListResponse<WorkOSUser>;
-
+      }) as WorkOSListResponse<any>;
+      
       const workosUsers = response.data;
       console.log(`Fetched ${workosUsers.length} users`);
 
@@ -118,11 +136,10 @@ async function migrateFromWorkOS() {
       for (const workosUser of workosUsers) {
         try {
           console.log(`\nProcessing user: ${workosUser.email}`);
-          console.log(workosUser);
 
           const authFactorsResponse = await workos.userManagement.listAuthFactors({
             userId: workosUser.id,
-          }) as WorkOSListResponse<WorkOSAuthFactor>;
+          }) as WorkOSListResponse<any>;
           
           const authFactors = authFactorsResponse.data;
           console.log(`Found ${authFactors.length} auth factors`);
@@ -147,6 +164,49 @@ async function migrateFromWorkOS() {
             forceAllowId: true
           });
 
+          // Create credential account for email/password users
+          const emailFactor = authFactors.find(f => f.type === "email" && f.email_configuration);
+          if (emailFactor) {
+            await ctx.adapter.create({
+              model: "account",
+              data: {
+                userId: createdUser.id,
+                type: "credentials",
+                provider: "credentials",
+                providerAccountId: workosUser.id,
+                password: emailFactor.email_configuration.hashedPassword,
+                createdAt: safeDateConversion(emailFactor.createdAt),
+                updatedAt: safeDateConversion(emailFactor.updatedAt)
+              },
+              forceAllowId: true
+            });
+            console.log('Created credentials account');
+          }
+
+          // Create OAuth provider accounts
+          try {
+            const connection = await workos.sso.getConnection(workosUser.id);
+            console.log(connection);
+            if (connection) {
+              const provider = connection.type.toLowerCase();
+              await ctx.adapter.create({
+                model: "account",
+                data: {
+                  userId: createdUser.id,
+                  type: "oauth",
+                  provider,
+                  providerAccountId: connection.id,
+                  createdAt: safeDateConversion(connection.createdAt),
+                  updatedAt: safeDateConversion(connection.updatedAt)
+                },
+                forceAllowId: true
+              });
+              console.log(`Created ${provider} OAuth account`);
+            }
+          } catch (error) {
+            console.warn(`No OAuth connection found for user ${workosUser.email}`);
+          }
+          // Handle 2FA settings
           for (const factor of authFactors) {
             if (factor.type === "totp" && factor.totp_configuration) {
               await ctx.adapter.create({
@@ -183,5 +243,4 @@ Migration Summary:
 `);
 }
 
-// Run the migration
 migrateFromWorkOS().catch(console.error); 
